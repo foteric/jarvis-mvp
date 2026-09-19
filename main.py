@@ -7,9 +7,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GROQ_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
 SYSTEM_PROMPT = (
     "You are J.A.R.V.I.S., a dry-witted, loyal, and highly capable personal "
