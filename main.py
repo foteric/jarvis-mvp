@@ -471,6 +471,6 @@ HTML_PAGE = """<!DOCTYPE html>
 </html>"""
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 async def index():
-    return HTML_PAGE
+    return HTMLResponse(content=HTML_PAGE, headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
