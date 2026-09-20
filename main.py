@@ -3,13 +3,18 @@ import uuid
 from typing import Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 GROQ_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GROQ_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GROQ_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 GROQ_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+
+# A shared passphrase that gates the /api/chat endpoint. Without this, anyone
+# who finds the public Render URL could use your Gemini quota. If this is left
+# unset, auth is disabled and /health reports that clearly.
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
 SYSTEM_PROMPT = (
     "You are J.A.R.V.I.S., a dry-witted, loyal, and highly capable personal "
@@ -40,16 +45,20 @@ def health():
         "status": "ok",
         "model": GROQ_MODEL,
         "llm_configured": bool(GROQ_API_KEY),
+        "auth_enabled": bool(APP_PASSWORD),
         "active_sessions": len(sessions),
     }
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, x_app_password: Optional[str] = Header(None, alias="X-App-Password")):
+    if APP_PASSWORD and x_app_password != APP_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid or missing passphrase.")
+
     if not GROQ_API_KEY:
         raise HTTPException(
             status_code=500,
-            detail="GROQ_API_KEY is not set on the server. Add it in your Render environment variables.",
+            detail="GEMINI_API_KEY is not set on the server. Add it in your Render environment variables.",
         )
 
     if not req.message or not req.message.strip():
@@ -140,6 +149,12 @@ HTML_PAGE = """<!DOCTYPE html>
     margin-left: auto; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     font-size: 11px; color: var(--text-dim); text-align: right;
   }
+  #speakToggle {
+    background: none; border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text-dim); font-size: 14px; line-height: 1; padding: 6px 8px;
+    margin-left: 8px; cursor: pointer; flex-shrink: 0;
+  }
+  #speakToggle.active { color: var(--accent); border-color: var(--accent-dim); }
   main {
     flex: 1; overflow-y: auto; padding: 18px 14px 10px;
     display: flex; flex-direction: column; gap: 12px;
@@ -175,6 +190,15 @@ HTML_PAGE = """<!DOCTYPE html>
     display: flex; gap: 8px; padding: 12px 14px calc(env(safe-area-inset-bottom, 0px) + 12px);
     border-top: 1px solid var(--border); background: rgba(10, 14, 20, 0.85); backdrop-filter: blur(6px);
   }
+  #mic {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--accent); font-size: 18px; width: 44px; flex-shrink: 0; cursor: pointer;
+  }
+  #mic.listening {
+    background: var(--danger); border-color: var(--danger); color: #fff;
+    animation: pulse 1s infinite;
+  }
+  #mic:disabled { opacity: 0.3; cursor: default; }
   #input {
     flex: 1; resize: none; background: var(--panel); border: 1px solid var(--border);
     border-radius: 4px; color: var(--text); padding: 11px 12px; font-size: 15px;
@@ -187,14 +211,47 @@ HTML_PAGE = """<!DOCTYPE html>
   }
   #send:disabled { opacity: 0.4; cursor: default; }
   #send:active:not(:disabled) { transform: translateY(1px); }
+
+  .auth-overlay {
+    position: fixed; inset: 0; background: rgba(10, 14, 20, 0.96);
+    display: none; align-items: center; justify-content: center; z-index: 100; padding: 20px;
+  }
+  .auth-box {
+    background: var(--panel); border: 1px solid var(--border); border-left: 2px solid var(--accent);
+    border-radius: 6px; padding: 24px 20px; width: 100%; max-width: 320px; text-align: center;
+  }
+  .auth-box h2 { margin: 0 0 4px; font-size: 16px; letter-spacing: 0.06em; }
+  .auth-box p { margin: 0 0 16px; color: var(--text-dim); font-size: 13px; }
+  #authInput {
+    width: 100%; background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text); padding: 10px 12px; font-size: 15px; margin-bottom: 12px;
+    text-align: center; letter-spacing: 0.15em;
+  }
+  #authInput:focus { outline: none; border-color: var(--accent); }
+  #authSubmit {
+    width: 100%; background: var(--accent); color: #06131c; border: none; border-radius: 4px;
+    padding: 10px; font-weight: 600; font-size: 14px; letter-spacing: 0.04em; cursor: pointer;
+  }
+  .auth-error { color: var(--danger); font-size: 12px; margin-top: 10px; min-height: 14px; }
 </style>
 </head>
 <body>
+
+<div class="auth-overlay" id="authOverlay">
+  <div class="auth-box">
+    <h2>J.A.R.V.I.S.</h2>
+    <p>Enter your passphrase to continue</p>
+    <input id="authInput" type="password" placeholder="Passphrase" autocomplete="off" />
+    <button id="authSubmit">UNLOCK</button>
+    <div class="auth-error" id="authError"></div>
+  </div>
+</div>
 
 <header>
   <div class="dot pulse" id="statusDot"></div>
   <h1>J.A.R.V.I.S.</h1>
   <div class="status" id="statusText">CONNECTING…</div>
+  <button id="speakToggle" title="Toggle voice output">🔇</button>
 </header>
 
 <main id="messages">
@@ -202,6 +259,7 @@ HTML_PAGE = """<!DOCTYPE html>
 </main>
 
 <footer>
+  <button id="mic" title="Voice input">🎤</button>
   <textarea id="input" rows="1" placeholder="Say something…" autofocus></textarea>
   <button id="send">SEND</button>
 </footer>
@@ -210,11 +268,93 @@ HTML_PAGE = """<!DOCTYPE html>
   const messagesEl = document.getElementById('messages');
   const inputEl = document.getElementById('input');
   const sendEl = document.getElementById('send');
+  const micEl = document.getElementById('mic');
+  const speakToggleEl = document.getElementById('speakToggle');
   const statusDot = document.getElementById('statusDot');
   const statusText = document.getElementById('statusText');
+  const authOverlay = document.getElementById('authOverlay');
+  const authInput = document.getElementById('authInput');
+  const authSubmit = document.getElementById('authSubmit');
+  const authError = document.getElementById('authError');
 
   const SESSION_KEY = 'jarvis_session_id';
+  const AUTH_KEY = 'jarvis_app_password';
   let sessionId = localStorage.getItem(SESSION_KEY) || null;
+  let appPassword = localStorage.getItem(AUTH_KEY) || '';
+
+  function showAuthOverlay(message) {
+    authOverlay.style.display = 'flex';
+    authError.textContent = message || '';
+    authInput.value = '';
+    authInput.focus();
+  }
+  function hideAuthOverlay() {
+    authOverlay.style.display = 'none';
+  }
+
+  authSubmit.addEventListener('click', () => {
+    const val = authInput.value.trim();
+    if (!val) return;
+    appPassword = val;
+    localStorage.setItem(AUTH_KEY, appPassword);
+    hideAuthOverlay();
+  });
+  authInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') authSubmit.click();
+  });
+
+  // --- Voice output (text-to-speech) ---
+  let voiceEnabled = localStorage.getItem('jarvis_voice_enabled') === 'true';
+
+  function updateSpeakToggleUI() {
+    speakToggleEl.textContent = voiceEnabled ? '🔊' : '🔇';
+    speakToggleEl.classList.toggle('active', voiceEnabled);
+  }
+  updateSpeakToggleUI();
+
+  speakToggleEl.addEventListener('click', () => {
+    voiceEnabled = !voiceEnabled;
+    localStorage.setItem('jarvis_voice_enabled', voiceEnabled);
+    updateSpeakToggleUI();
+    if (!voiceEnabled && window.speechSynthesis) window.speechSynthesis.cancel();
+  });
+
+  function speak(text) {
+    if (!voiceEnabled || !window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.0;
+    utterance.pitch = 1.0;
+    window.speechSynthesis.speak(utterance);
+  }
+
+  // --- Voice input (speech-to-text) ---
+  const SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let recognition = null;
+
+  if (SpeechRecognitionImpl) {
+    recognition = new SpeechRecognitionImpl();
+    recognition.lang = 'en-US';
+    recognition.interimResults = false;
+    recognition.maxAlternatives = 1;
+
+    recognition.onstart = () => micEl.classList.add('listening');
+    recognition.onend = () => micEl.classList.remove('listening');
+    recognition.onerror = () => micEl.classList.remove('listening');
+    recognition.onresult = (event) => {
+      const transcript = event.results[0][0].transcript;
+      inputEl.value = transcript;
+      sendMessage();
+    };
+
+    micEl.addEventListener('click', () => {
+      if (window.speechSynthesis) window.speechSynthesis.cancel();
+      try { recognition.start(); } catch (e) { /* already listening */ }
+    });
+  } else {
+    micEl.disabled = true;
+    micEl.title = 'Voice input not supported in this browser';
+  }
 
   function addMessage(role, text) {
     const div = document.createElement('div');
@@ -253,6 +393,9 @@ HTML_PAGE = """<!DOCTYPE html>
         statusDot.classList.add('offline');
         statusText.textContent = 'NO API KEY SET';
       }
+      if (data.auth_enabled && !appPassword) {
+        showAuthOverlay();
+      }
     } catch (e) {
       statusDot.classList.add('offline');
       statusText.textContent = 'UNREACHABLE';
@@ -272,9 +415,21 @@ HTML_PAGE = """<!DOCTYPE html>
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-App-Password': appPassword,
+        },
         body: JSON.stringify({ session_id: sessionId, message: text }),
       });
+
+      if (res.status === 401) {
+        thinkingEl.remove();
+        localStorage.removeItem(AUTH_KEY);
+        appPassword = '';
+        inputEl.value = text;
+        showAuthOverlay('Incorrect passphrase. Try again.');
+        return;
+      }
 
       const data = await res.json();
       thinkingEl.remove();
@@ -287,6 +442,7 @@ HTML_PAGE = """<!DOCTYPE html>
       sessionId = data.session_id;
       localStorage.setItem(SESSION_KEY, sessionId);
       addMessage('assistant', data.reply);
+      speak(data.reply);
     } catch (e) {
       thinkingEl.remove();
       addMessage('system', 'CONNECTION FAILED: ' + e.message);
