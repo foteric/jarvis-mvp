@@ -1,7 +1,9 @@
+import json
 import os
 import uuid
 from typing import Dict, List, Optional
 
+import asyncpg
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
@@ -16,6 +18,11 @@ GROQ_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/complet
 # unset, auth is disabled and /health reports that clearly.
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
 
+# Neon Postgres connection string. If unset, chat history falls back to an
+# in-memory dict (same behavior as before) so nothing breaks -- it just won't
+# survive a restart until this is configured.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
 SYSTEM_PROMPT = (
     "You are J.A.R.V.I.S., a dry-witted, loyal, and highly capable personal "
     "assistant. Keep replies concise, clear, and genuinely useful. Speak with "
@@ -26,7 +33,67 @@ MAX_HISTORY_MESSAGES = 20
 
 app = FastAPI(title="J.A.R.V.I.S. MVP")
 
-sessions: Dict[str, List[dict]] = {}
+# Fallback store, used only if DATABASE_URL isn't configured.
+_memory_sessions: Dict[str, List[dict]] = {}
+db_pool: Optional[asyncpg.pool.Pool] = None
+
+
+@app.on_event("startup")
+async def on_startup():
+    global db_pool
+    if DATABASE_URL:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id TEXT PRIMARY KEY,
+                    history JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    if db_pool:
+        await db_pool.close()
+
+
+async def get_history(session_id: str) -> List[dict]:
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT history FROM sessions WHERE session_id = $1", session_id)
+            if row and row["history"]:
+                value = row["history"]
+                return json.loads(value) if isinstance(value, str) else value
+            return []
+    return _memory_sessions.get(session_id, [])
+
+
+async def save_history(session_id: str, history: List[dict]) -> None:
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO sessions (session_id, history, updated_at)
+                VALUES ($1, $2::jsonb, now())
+                ON CONFLICT (session_id)
+                DO UPDATE SET history = $2::jsonb, updated_at = now()
+                """,
+                session_id,
+                json.dumps(history),
+            )
+    else:
+        _memory_sessions[session_id] = history
+
+
+async def count_sessions() -> int:
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            return await conn.fetchval("SELECT COUNT(*) FROM sessions")
+    return len(_memory_sessions)
 
 
 class ChatRequest(BaseModel):
@@ -40,13 +107,14 @@ class ChatResponse(BaseModel):
 
 
 @app.get("/health")
-def health():
+async def health():
     return {
         "status": "ok",
         "model": GROQ_MODEL,
         "llm_configured": bool(GROQ_API_KEY),
         "auth_enabled": bool(APP_PASSWORD),
-        "active_sessions": len(sessions),
+        "db_configured": bool(DATABASE_URL),
+        "active_sessions": await count_sessions(),
     }
 
 
@@ -65,10 +133,10 @@ async def chat(req: ChatRequest, x_app_password: Optional[str] = Header(None, al
         raise HTTPException(status_code=400, detail="message must not be empty.")
 
     session_id = req.session_id or str(uuid.uuid4())
-    history = sessions.setdefault(session_id, [])
+    history = await get_history(session_id)
 
     history.append({"role": "user", "content": req.message})
-    del history[:-MAX_HISTORY_MESSAGES]
+    history = history[-MAX_HISTORY_MESSAGES:]
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
 
@@ -91,7 +159,8 @@ async def chat(req: ChatRequest, x_app_password: Optional[str] = Header(None, al
     reply = data["choices"][0]["message"]["content"]
 
     history.append({"role": "assistant", "content": reply})
-    del history[:-MAX_HISTORY_MESSAGES]
+    history = history[-MAX_HISTORY_MESSAGES:]
+    await save_history(session_id, history)
 
     return ChatResponse(session_id=session_id, reply=reply)
 
