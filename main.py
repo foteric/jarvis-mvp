@@ -9,10 +9,9 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-GROQ_API_KEY = os.environ.get("CEREBRAS_API_KEY", "")
-GROQ_MODEL = os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b")
-GROQ_URL = "https://api.cerebras.ai/v1/chat/completions"
-
+GROQ_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+GROQ_MODEL = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+GROQ_URL = "https://openrouter.ai/api/v1/chat/completions"
 # A shared passphrase that gates the /api/chat endpoint. Without this, anyone
 # who finds the public Render URL could use your Gemini quota. If this is left
 # unset, auth is disabled and /health reports that clearly.
